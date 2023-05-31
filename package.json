@@ -1,0 +1,37 @@
+{
+    "name": "P2PNonprofit",
+    "version": "1.0.0",
+    "description": "Custom Celo Composer project.",
+    "private": true,
+    "author": "Celo",
+    "license": "MIT",
+    "scripts": {
+        "react-app:dev": "yarn workspace @P2PNonprofit/react-app dev",
+        "react-app:build": "yarn workspace @P2PNonprofit/react-app build",
+        "react-app:start": "yarn workspace @P2PNonprofit/react-app start",
+        "react-app:lint": "yarn workspace @P2PNonprofit/react-app lint",
+        "hardhat:test": "yarn workspace @P2PNonprofit/hardhat test",
+        "hardhat:test-local": "yarn workspace @P2PNonprofit/hardhat test-local",
+        "hardhat:accounts": "yarn workspace @P2PNonprofit/hardhat accounts",
+        "hardhat:devchain": "yarn workspace @P2PNonprofit/hardhat devchain",
+        "hardhat:deploy": "yarn workspace @P2PNonprofit/hardhat deploy",
+        "hardhat:deploy-reset-watch": "yarn workspace @P2PNonprofit/hardhat deploy-reset-watch",
+        "hardhat:watch": "yarn workspace @P2PNonprofit/hardhat watch",
+        "hardhat:fork-mainnet": "yarn workspace @P2PNonprofit/hardhat fork-mainnet"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/celo-org/celo-composer.git"
+    },
+    "bugs": {
+        "url": "https://github.com/celo-org/celo-composer/issues"
+    },
+    "homepage": "https://github.com/celo-org/celo-composer/blob/main/README.md",
+    "workspaces": [
+        "packages/*"
+    ],
+    "keywords": [
+        "celo-composer",
+        "celo"
+    ]
+}
