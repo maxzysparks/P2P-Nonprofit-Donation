@@ -118,11 +118,13 @@ contract P2PNonprofitDonation {
             _amount >= MIN_DONATION_AMOUNT && _amount <= MAX_DONATION_AMOUNT,
             "Donation amount must be between MIN_DONATION_AMOUNT and MAX_DONATION_AMOUNT"
         );
+
         require(
             _equityPercentage >= MIN_EQUITY_PERCENTAGE &&
                 _equityPercentage <= MAX_EQUITY_PERCENTAGE,
-            "Equity percentage must be between MIN_EQUITY_PERCENTAGE and MAX_EQUITY_PERCENTAGE"
+            "Equity percentage out of range"
         );
+
         require(
             bytes(_nonprofitName).length > 0,
             "Nonprofit name cannot be empty"
@@ -130,7 +132,7 @@ contract P2PNonprofitDonation {
         require(bytes(_description).length > 0, "Description cannot be empty");
         require(_valuation > 0, "Nonprofit valuation must be greater than 0");
 
-        uint _fundingDeadline = block.timestamp + (1 days);
+        uint _fundingDeadline = block.number + (1 days);
         uint donationId = donationCount++;
 
         Donation storage donation = donations[donationId];
@@ -168,7 +170,7 @@ contract P2PNonprofitDonation {
         );
         require(donation.amount == msg.value, "Incorrect donation amount");
         require(
-            block.timestamp <= donation.fundingDeadline,
+            block.number <= donation.fundingDeadline,
             "Donation funding deadline has passed"
         );
         payable(address(this)).transfer(msg.value);
@@ -205,7 +207,7 @@ contract P2PNonprofitDonation {
     ) external onlyDonor(_donationId) onlyActiveDonation(_donationId) {
         Donation storage donation = donations[_donationId];
         require(
-            block.timestamp < donation.fundingDeadline,
+            block.number < donation.fundingDeadline,
             "Donation funding deadline has passed"
         );
 
@@ -252,7 +254,7 @@ contract P2PNonprofitDonation {
         uint _donationId
     ) external onlyDonor(_donationId) {
         Donation storage donation = donations[_donationId];
-        require(!donation.active);
+        require(!donation.active, "Donation must be inactive to withdraw.");
         payable(msg.sender).transfer(donation.amount);
     }
 }
