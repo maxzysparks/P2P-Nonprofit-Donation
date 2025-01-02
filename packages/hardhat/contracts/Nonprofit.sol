@@ -1,260 +1,422 @@
 // SPDX-License-Identifier: MIT
-pragma solidity >=0.5.0 <0.9.0;
+pragma solidity 0.8.19;
 
-contract P2PNonprofitDonation {
-    // The minimum and maximum amount of ETH that can be donated
-    uint public constant MIN_DONATION_AMOUNT = 0.1 ether;
-    uint public constant MAX_DONATION_AMOUNT = 10 ether;
-    // The minimum and maximum equity percentage that can be offered for a donation
-    uint public constant MIN_EQUITY_PERCENTAGE = 1;
-    uint public constant MAX_EQUITY_PERCENTAGE = 10;
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/security/SignatureChecker.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
+contract P2PNonprofitDonation is 
+    Initializable, 
+    PausableUpgradeable, 
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    UUPSUpgradeable 
+{
+    using Counters for Counters.Counter;
+
+    // Custom errors
+    error InvalidAmount();
+    error InvalidAddress();
+    error InvalidDeadline();
+    error InvalidPercentage();
+    error UnauthorizedAccess();
+    error DonationNotActive();
+    error DeadlinePassed();
+    error InsufficientFunds();
+    error TransferFailed();
+    error InvalidRating();
+    error AlreadyRated();
+    error EmptyString();
+    error ZeroValue();
+
+    // Roles
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant NONPROFIT_ROLE = keccak256("NONPROFIT_ROLE");
+    bytes32 public constant DONOR_ROLE = keccak256("DONOR_ROLE");
+
+    // State variables
+    uint256 public constant MIN_DONATION_AMOUNT = 0.1 ether;
+    uint256 public constant MAX_DONATION_AMOUNT = 10 ether;
+    uint8 public constant MIN_EQUITY_PERCENTAGE = 1;
+    uint8 public constant MAX_EQUITY_PERCENTAGE = 10;
+    uint256 public constant FUNDING_PERIOD = 30 days;
+    uint256 public constant MAX_EXTENSION_PERIOD = 90 days;
+    
+    Counters.Counter private _donationIds;
+    
+    // Packed structs for gas optimization
     struct Donation {
-        uint amount;
-        uint equityPercentage;
-        uint fundingDeadline;
-        string nonprofitName;
-        string description;
-        uint valuation;
-        address payable donor;
-        address payable nonprofit;
-        bool active;
-        bool distributed;
+        address payable donor;          // 20 bytes
+        address payable nonprofit;      // 20 bytes
+        uint96 amount;                  // 12 bytes
+        uint32 fundingDeadline;        // 4 bytes
+        uint8 equityPercentage;        // 1 byte
+        bool active;                    // 1 byte
+        bool distributed;               // 1 byte
+        string nonprofitName;          // 32 bytes (reference)
+        string description;            // 32 bytes (reference)
+        uint256 valuation;            // 32 bytes
     }
 
-    struct Reputation {
-        uint rating;
-        string review;
+    struct UserReputation {
+        uint8 rating;                  // 1 byte
+        uint32 lastUpdated;           // 4 bytes
+        uint16 totalRatings;          // 2 bytes
+        string review;                // 32 bytes (reference)
     }
-    mapping(address => Reputation) public donorReputations;
-    mapping(address => Reputation) public nonprofitReputations;
-    mapping(address => bool) public registeredUsers;
-    mapping(address => bytes32) private userPasswords;
-    mapping(uint => Donation) public donations;
-    uint public donationCount;
 
+    // Mappings
+    mapping(uint256 => Donation) private _donations;
+    mapping(uint256 => uint256) private _escrowBalances;
+    mapping(address => UserReputation) private _donorReputations;
+    mapping(address => UserReputation) private _nonprofitReputations;
+    mapping(address => uint256) private _userDonationCount;
+    mapping(address => mapping(uint256 => bool)) private _hasRated;
+
+    // Events
     event DonationCreated(
-        uint donationId,
-        uint amount,
-        uint equityPercentage,
-        uint fundingDeadline,
-        string nonprofitName,
-        string description,
-        uint valuation,
-        address donor,
-        address nonprofit
+        uint256 indexed donationId,
+        address indexed donor,
+        uint256 amount,
+        uint8 equityPercentage,
+        uint32 fundingDeadline,
+        string nonprofitName
     );
 
-    event DonationFunded(uint donationId, address funder, uint amount);
-    event DonationDistributed(uint donationId, uint amount);
-    event UserRegistered(address user);
-    event UserLoggedIn(address user);
+    event DonationFunded(
+        uint256 indexed donationId,
+        address indexed nonprofit,
+        uint256 amount
+    );
 
-    modifier onlyRegisteredUser() {
-        require(registeredUsers[msg.sender], "User is not registered");
+    event DonationDistributed(
+        uint256 indexed donationId,
+        address indexed nonprofit,
+        uint256 amount
+    );
+
+    event ReputationUpdated(
+        address indexed user,
+        address indexed rater,
+        uint8 rating,
+        string review
+    );
+
+    event FundingPeriodExtended(
+        uint256 indexed donationId,
+        uint32 newDeadline
+    );
+
+    event DonationCancelled(
+        uint256 indexed donationId,
+        address indexed donor,
+        uint256 amount
+    );
+
+    event EmergencyWithdrawal(
+        address indexed admin,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// @notice Initializes the contract
+    /// @param admin Address of the contract admin
+    function initialize(address admin) external initializer {
+        if (admin == address(0)) revert InvalidAddress();
+
+        __Pausable_init();
+        __AccessControl_init();
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        _setupRole(DEFAULT_ADMIN_ROLE, admin);
+        _setupRole(ADMIN_ROLE, admin);
+    }
+
+    // Modifiers
+    modifier validAmount(uint256 amount) {
+        if (amount < MIN_DONATION_AMOUNT || amount > MAX_DONATION_AMOUNT) 
+            revert InvalidAmount();
         _;
     }
 
-    modifier onlyActiveDonation(uint _donationId) {
-        require(donations[_donationId].active, "Donation is not active");
+    modifier validAddress(address addr) {
+        if (addr == address(0)) revert InvalidAddress();
         _;
     }
 
-    modifier onlyDonor(uint _donationId) {
-        require(
-            msg.sender == donations[_donationId].donor,
-            "Only the donor can perform this action"
-        );
+    modifier onlyActiveDonation(uint256 donationId) {
+        if (!_donations[donationId].active) revert DonationNotActive();
         _;
     }
 
-    function registerUser(bytes32 _password) external {
-        require(!registeredUsers[msg.sender], "User is already registered");
-        require(_password != "", "Password cannot be empty");
-
-        registeredUsers[msg.sender] = true;
-        userPasswords[msg.sender] = _password;
-
-        emit UserRegistered(msg.sender);
+    modifier withinDeadline(uint256 donationId) {
+        if (block.timestamp > _donations[donationId].fundingDeadline) 
+            revert DeadlinePassed();
+        _;
     }
 
-    function login(bytes32 _password) external {
-        require(registeredUsers[msg.sender], "User is not registered");
-        require(userPasswords[msg.sender] == _password, "Invalid password");
-
-        emit UserLoggedIn(msg.sender);
-    }
-
-    function rateDonor(
-        address _donor,
-        uint _rating,
-        string memory _review
-    ) external onlyRegisteredUser {
-        require(_rating >= 1 && _rating <= 5, "Rating must be between 1 and 5");
-
-        donorReputations[_donor].rating = _rating;
-        donorReputations[_donor].review = _review;
-    }
-
-    function rateNonprofit(
-        address _nonprofit,
-        uint _rating,
-        string memory _review
-    ) external onlyRegisteredUser {
-        require(_rating >= 1 && _rating <= 5, "Rating must be between 1 and 5");
-
-        nonprofitReputations[_nonprofit].rating = _rating;
-        nonprofitReputations[_nonprofit].review = _review;
-    }
-
+    /// @notice Creates a new donation
+    /// @param amount The donation amount
+    /// @param equityPercentage The equity percentage offered
+    /// @param nonprofitName The name of the nonprofit
+    /// @param description The donation description
+    /// @param valuation The nonprofit's valuation
+    /// @return donationId The ID of the created donation
     function createDonation(
-        uint _amount,
-        uint _equityPercentage,
-        string memory _nonprofitName,
-        string memory _description,
-        uint _valuation
-    ) external payable {
-        require(
-            _amount >= MIN_DONATION_AMOUNT && _amount <= MAX_DONATION_AMOUNT,
-            "Donation amount must be between MIN_DONATION_AMOUNT and MAX_DONATION_AMOUNT"
-        );
+        uint256 amount,
+        uint8 equityPercentage,
+        string calldata nonprofitName,
+        string calldata description,
+        uint256 valuation
+    ) 
+        external 
+        payable
+        whenNotPaused
+        nonReentrant
+        validAmount(amount)
+        returns (uint256 donationId)
+    {
+        if (equityPercentage < MIN_EQUITY_PERCENTAGE || 
+            equityPercentage > MAX_EQUITY_PERCENTAGE) revert InvalidPercentage();
+        if (bytes(nonprofitName).length == 0) revert EmptyString();
+        if (bytes(description).length == 0) revert EmptyString();
+        if (valuation == 0) revert ZeroValue();
 
-        require(
-            _equityPercentage >= MIN_EQUITY_PERCENTAGE &&
-                _equityPercentage <= MAX_EQUITY_PERCENTAGE,
-            "Equity percentage out of range"
-        );
+        donationId = _donationIds.current();
+        uint32 deadline = uint32(block.timestamp + FUNDING_PERIOD);
 
-        require(
-            bytes(_nonprofitName).length > 0,
-            "Nonprofit name cannot be empty"
-        );
-        require(bytes(_description).length > 0, "Description cannot be empty");
-        require(_valuation > 0, "Nonprofit valuation must be greater than 0");
-
-        uint _fundingDeadline = block.number + (1 days);
-        uint donationId = donationCount++;
-
-        Donation storage donation = donations[donationId];
-        donation.amount = _amount;
-        donation.equityPercentage = _equityPercentage;
-        donation.fundingDeadline = _fundingDeadline;
-        donation.nonprofitName = _nonprofitName;
-        donation.description = _description;
-        donation.valuation = _valuation;
+        Donation storage donation = _donations[donationId];
         donation.donor = payable(msg.sender);
-        donation.nonprofit = payable(address(0));
+        donation.amount = uint96(amount);
+        donation.equityPercentage = equityPercentage;
+        donation.fundingDeadline = deadline;
+        donation.nonprofitName = nonprofitName;
+        donation.description = description;
+        donation.valuation = valuation;
         donation.active = true;
-        donation.distributed = false;
+
+        _grantRole(DONOR_ROLE, msg.sender);
+        _userDonationCount[msg.sender]++;
+        _donationIds.increment();
 
         emit DonationCreated(
             donationId,
-            _amount,
-            _equityPercentage,
-            _fundingDeadline,
-            _nonprofitName,
-            _description,
-            _valuation,
             msg.sender,
-            address(0)
+            amount,
+            equityPercentage,
+            deadline,
+            nonprofitName
         );
+
+        return donationId;
     }
 
-    function fundDonation(
-        uint _donationId
-    ) external payable onlyActiveDonation(_donationId) {
-        Donation storage donation = donations[_donationId];
-        require(
-            msg.sender != donation.donor,
-            "Donor cannot fund their own donation"
-        );
-        require(donation.amount == msg.value, "Incorrect donation amount");
-        require(
-            block.number <= donation.fundingDeadline,
-            "Donation funding deadline has passed"
-        );
-        payable(address(this)).transfer(msg.value);
+    /// @notice Funds an active donation
+    /// @param donationId The ID of the donation to fund
+    function fundDonation(uint256 donationId) 
+        external 
+        payable
+        whenNotPaused
+        nonReentrant
+        onlyActiveDonation(donationId)
+        withinDeadline(donationId)
+    {
+        Donation storage donation = _donations[donationId];
+        if (msg.sender == donation.donor) revert UnauthorizedAccess();
+        if (msg.value != donation.amount) revert InvalidAmount();
+
         donation.nonprofit = payable(msg.sender);
         donation.active = false;
+        _escrowBalances[donationId] = msg.value;
+        
+        _grantRole(NONPROFIT_ROLE, msg.sender);
 
-        emit DonationFunded(_donationId, msg.sender, msg.value);
+        emit DonationFunded(donationId, msg.sender, msg.value);
     }
 
-    function distributeDonation(
-        uint _donationId
-    ) external payable onlyActiveDonation(_donationId) onlyDonor(_donationId) {
-        Donation storage donation = donations[_donationId];
-        require(msg.value == donation.amount, "Incorrect distribution amount");
-        donation.nonprofit.transfer(msg.value);
+    /// @notice Distributes a funded donation
+    /// @param donationId The ID of the donation to distribute
+    function distributeDonation(uint256 donationId)
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        Donation storage donation = _donations[donationId];
+        if (msg.sender != donation.donor) revert UnauthorizedAccess();
+        if (donation.distributed) revert UnauthorizedAccess();
+
+        uint256 amount = _escrowBalances[donationId];
+        if (amount == 0) revert InsufficientFunds();
+
+        _escrowBalances[donationId] = 0;
         donation.distributed = true;
-        donation.active = false;
 
-        emit DonationDistributed(_donationId, msg.value);
+        (bool success, ) = donation.nonprofit.call{value: amount}("");
+        if (!success) revert TransferFailed();
+
+        emit DonationDistributed(donationId, donation.nonprofit, amount);
     }
 
-    function extendFundingPeriod(
-        uint _donationId,
-        uint _extensionDays
-    ) external onlyDonor(_donationId) onlyActiveDonation(_donationId) {
-        Donation storage donation = donations[_donationId];
-        require(_extensionDays > 0, "Extension days must be greater than 0");
-
-        donation.fundingDeadline += (_extensionDays * 1 days);
-    }
-
-    function cancelDonation(
-        uint _donationId
-    ) external onlyDonor(_donationId) onlyActiveDonation(_donationId) {
-        Donation storage donation = donations[_donationId];
-        require(
-            block.number < donation.fundingDeadline,
-            "Donation funding deadline has passed"
-        );
-
-        donation.active = false;
-
-        // Return the donation amount to the donor
-        payable(donation.donor).transfer(donation.amount);
-    }
-
-    function getDonationInfo(
-        uint _donationId
+    /// @notice Updates a user's reputation
+    /// @param user The address of the user to rate
+    /// @param rating The rating (1-5)
+    /// @param review The review text
+    function updateReputation(
+        address user,
+        uint8 rating,
+        string calldata review
     )
         external
-        view
-        returns (
-            uint amount,
-            uint equityPercentage,
-            uint fundingDeadline,
-            string memory nonprofitName,
-            string memory description,
-            uint valuation,
-            address donor,
-            address nonprofit,
-            bool active,
-            bool distributed
-        )
+        whenNotPaused
+        validAddress(user)
     {
-        Donation storage donation = donations[_donationId];
-        return (
-            donation.amount,
-            donation.equityPercentage,
-            donation.fundingDeadline,
-            donation.nonprofitName,
-            donation.description,
-            donation.valuation,
-            donation.donor,
-            donation.nonprofit,
-            donation.active,
-            donation.distributed
+        if (rating < 1 || rating > 5) revert InvalidRating();
+        if (_hasRated[msg.sender][_userDonationCount[user]]) 
+            revert AlreadyRated();
+        if (bytes(review).length == 0) revert EmptyString();
+
+        UserReputation storage reputation = hasRole(NONPROFIT_ROLE, user) 
+            ? _nonprofitReputations[user]
+            : _donorReputations[user];
+
+        reputation.rating = uint8(
+            (reputation.rating * reputation.totalRatings + rating) / 
+            (reputation.totalRatings + 1)
         );
+        reputation.totalRatings++;
+        reputation.lastUpdated = uint32(block.timestamp);
+        reputation.review = review;
+
+        _hasRated[msg.sender][_userDonationCount[user]] = true;
+
+        emit ReputationUpdated(user, msg.sender, rating, review);
     }
 
-    function withdrawDonation(
-        uint _donationId
-    ) external onlyDonor(_donationId) {
-        Donation storage donation = donations[_donationId];
-        require(!donation.active, "Donation must be inactive to withdraw.");
-        payable(msg.sender).transfer(donation.amount);
+    /// @notice Extends the funding period for a donation
+    /// @param donationId The ID of the donation
+    /// @param extensionDays Number of days to extend
+    function extendFundingPeriod(
+        uint256 donationId,
+        uint32 extensionDays
+    )
+        external
+        whenNotPaused
+        onlyActiveDonation(donationId)
+        withinDeadline(donationId)
+    {
+        Donation storage donation = _donations[donationId];
+        if (msg.sender != donation.donor) revert UnauthorizedAccess();
+        if (extensionDays == 0) revert ZeroValue();
+
+        uint32 extension = uint32(extensionDays * 1 days);
+        if (extension > MAX_EXTENSION_PERIOD) revert InvalidDeadline();
+
+        uint32 newDeadline = donation.fundingDeadline + extension;
+        donation.fundingDeadline = newDeadline;
+
+        emit FundingPeriodExtended(donationId, newDeadline);
+    }
+
+    /// @notice Cancels an active donation
+    /// @param donationId The ID of the donation to cancel
+    function cancelDonation(uint256 donationId)
+        external
+        whenNotPaused
+        nonReentrant
+        onlyActiveDonation(donationId)
+    {
+        Donation storage donation = _donations[donationId];
+        if (msg.sender != donation.donor) revert UnauthorizedAccess();
+
+        donation.active = false;
+        uint256 amount = _escrowBalances[donationId];
+        if (amount > 0) {
+            _escrowBalances[donationId] = 0;
+            (bool success, ) = donation.donor.call{value: amount}("");
+            if (!success) revert TransferFailed();
+        }
+
+        emit DonationCancelled(donationId, msg.sender, amount);
+    }
+
+    /// @notice Emergency withdrawal of contract funds
+    /// @dev Only callable by admin
+    function emergencyWithdraw() 
+        external 
+        onlyRole(ADMIN_ROLE) 
+        nonReentrant 
+    {
+        uint256 balance = address(this).balance;
+        if (balance == 0) revert InsufficientFunds();
+
+        (bool success, ) = msg.sender.call{value: balance}("");
+        if (!success) revert TransferFailed();
+
+        emit EmergencyWithdrawal(msg.sender, balance, block.timestamp);
+    }
+
+    /// @notice Pauses the contract
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    /// @notice Unpauses the contract
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+
+    /// @notice Gets donation details
+    /// @param donationId The ID of the donation
+    /// @return Donation struct containing all donation details
+    function getDonation(uint256 donationId)
+        external
+        view
+        returns (Donation memory)
+    {
+        return _donations[donationId];
+    }
+
+    /// @notice Gets user reputation
+    /// @param user The address of the user
+    /// @return UserReputation struct containing reputation details
+    function getReputation(address user)
+        external
+        view
+        validAddress(user)
+        returns (UserReputation memory)
+    {
+        return hasRole(NONPROFIT_ROLE, user)
+            ? _nonprofitReputations[user]
+            : _donorReputations[user];
+    }
+
+    /// @notice Gets the current donation count
+    /// @return The current number of donations
+    function getDonationCount() external view returns (uint256) {
+        return _donationIds.current();
+    }
+
+    /// @notice Required override for UUPS proxy upgrade pattern
+    /// @param newImplementation Address of the new implementation
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(ADMIN_ROLE)
+    {}
+
+    /// @notice Fallback function to receive ETH
+    receive() external payable {
+        emit EmergencyWithdrawal(msg.sender, msg.value, block.timestamp);
     }
 }
