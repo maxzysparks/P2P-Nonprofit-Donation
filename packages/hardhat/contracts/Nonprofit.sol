@@ -124,13 +124,10 @@ contract P2PNonprofitDonation is
         uint256 timestamp
     );
 
-    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
-    /// @notice Initializes the contract
-    /// @param admin Address of the contract admin
     function initialize(address admin) external initializer {
         if (admin == address(0)) revert InvalidAddress();
 
@@ -166,13 +163,6 @@ contract P2PNonprofitDonation is
         _;
     }
 
-    /// @notice Creates a new donation
-    /// @param amount The donation amount
-    /// @param equityPercentage The equity percentage offered
-    /// @param nonprofitName The name of the nonprofit
-    /// @param description The donation description
-    /// @param valuation The nonprofit's valuation
-    /// @return donationId The ID of the created donation
     function createDonation(
         uint256 amount,
         uint8 equityPercentage,
@@ -222,8 +212,6 @@ contract P2PNonprofitDonation is
         return donationId;
     }
 
-    /// @notice Funds an active donation
-    /// @param donationId The ID of the donation to fund
     function fundDonation(uint256 donationId) 
         external 
         payable
@@ -245,8 +233,6 @@ contract P2PNonprofitDonation is
         emit DonationFunded(donationId, msg.sender, msg.value);
     }
 
-    /// @notice Distributes a funded donation
-    /// @param donationId The ID of the donation to distribute
     function distributeDonation(uint256 donationId)
         external
         whenNotPaused
@@ -268,10 +254,6 @@ contract P2PNonprofitDonation is
         emit DonationDistributed(donationId, donation.nonprofit, amount);
     }
 
-    /// @notice Updates a user's reputation
-    /// @param user The address of the user to rate
-    /// @param rating The rating (1-5)
-    /// @param review The review text
     function updateReputation(
         address user,
         uint8 rating,
@@ -303,9 +285,6 @@ contract P2PNonprofitDonation is
         emit ReputationUpdated(user, msg.sender, rating, review);
     }
 
-    /// @notice Extends the funding period for a donation
-    /// @param donationId The ID of the donation
-    /// @param extensionDays Number of days to extend
     function extendFundingPeriod(
         uint256 donationId,
         uint32 extensionDays
@@ -328,8 +307,6 @@ contract P2PNonprofitDonation is
         emit FundingPeriodExtended(donationId, newDeadline);
     }
 
-    /// @notice Cancels an active donation
-    /// @param donationId The ID of the donation to cancel
     function cancelDonation(uint256 donationId)
         external
         whenNotPaused
@@ -350,8 +327,6 @@ contract P2PNonprofitDonation is
         emit DonationCancelled(donationId, msg.sender, amount);
     }
 
-    /// @notice Emergency withdrawal of contract funds
-    /// @dev Only callable by admin
     function emergencyWithdraw() 
         external 
         onlyRole(ADMIN_ROLE) 
@@ -366,19 +341,14 @@ contract P2PNonprofitDonation is
         emit EmergencyWithdrawal(msg.sender, balance, block.timestamp);
     }
 
-    /// @notice Pauses the contract
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
     }
 
-    /// @notice Unpauses the contract
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
 
-    /// @notice Gets donation details
-    /// @param donationId The ID of the donation
-    /// @return Donation struct containing all donation details
     function getDonation(uint256 donationId)
         external
         view
@@ -387,9 +357,6 @@ contract P2PNonprofitDonation is
         return _donations[donationId];
     }
 
-    /// @notice Gets user reputation
-    /// @param user The address of the user
-    /// @return UserReputation struct containing reputation details
     function getReputation(address user)
         external
         view
@@ -401,21 +368,16 @@ contract P2PNonprofitDonation is
             : _donorReputations[user];
     }
 
-    /// @notice Gets the current donation count
-    /// @return The current number of donations
     function getDonationCount() external view returns (uint256) {
         return _donationIds.current();
     }
 
-    /// @notice Required override for UUPS proxy upgrade pattern
-    /// @param newImplementation Address of the new implementation
     function _authorizeUpgrade(address newImplementation)
         internal
         override
         onlyRole(ADMIN_ROLE)
     {}
 
-    /// @notice Fallback function to receive ETH
     receive() external payable {
         emit EmergencyWithdrawal(msg.sender, msg.value, block.timestamp);
     }
